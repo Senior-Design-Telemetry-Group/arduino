@@ -2,19 +2,23 @@
 #include <SD.h>
 #include "Wire.h"
 #include <Adafruit_GPS.h>
+#include "mcp2515_can.h"
 
 #define DispSerial Serial1
 #define LoRaSerial Serial2
 #define GPSSerial Serial3
 
-#define LOG_PACKETS
-
+// #define LOG_PACKETS
+const int SPI_CS_PIN = 9;
+mcp2515_can CAN(SPI_CS_PIN);
 Adafruit_GPS GPS(&GPSSerial);
 
 struct telemPacket {
   int RPM;
   float speed;
-  float slope;
+  float accel_x;
+  float accel_y;
+  float accel_z;
   float BV;
   float lon;
   float lat;
@@ -31,6 +35,7 @@ struct GPSData {
   bool valid;
   float lon;
   float lat;
+  float speed;
 };
 
 const int MPU_ADDR = 0x68; // I2C address of the MPU-6050. 
@@ -50,6 +55,10 @@ void init_imu() {
   Wire.write(0x6B); // PWR_MGMT_1 register
   Wire.write(0); // set to zero (wakes up the MPU-6050)
   Wire.endTransmission(true);
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x1C); // ACCEL_CONFIG
+  Wire.write(0); // Set scale range to +/- 2g
+  Wire.endTransmission(false);
 }
 
 imuData read_imu() {
@@ -82,9 +91,9 @@ void init_gps() {
   // 9600 NMEA is the default baud rate for Adafruit MTK GPS's- some use 4800
   GPS.begin(9600);
   // uncomment this line to turn on RMC (recommended minimum) and GGA (fix data) including altitude
-  GPS.sendCommand(PMTK_SET_NMEA_OUTPUT_RMCGGA);
+  // GPS.sendCommand(PMTK_SET_NMEA_OUTPUT_RMCGGA);
   // uncomment this line to turn on only the "minimum recommended" data
-  //GPS.sendCommand(PMTK_SET_NMEA_OUTPUT_RMCONLY);
+  GPS.sendCommand(PMTK_SET_NMEA_OUTPUT_RMCONLY);
   // Set the update rate
   GPS.sendCommand(PMTK_SET_NMEA_UPDATE_1HZ); // 1 Hz update rate
 
@@ -94,11 +103,30 @@ void init_gps() {
 
 GPSData read_gps() {
   GPSData data;
+  data.valid = false;
 
+  while (true) {
+    // read data from the GPS in the 'main loop'
+    char c = GPS.read();
+
+    if (!c) {
+      break;
+    }
+    // if a sentence is received, we can check the checksum
+    if (GPS.newNMEAreceived()) {
+      // Serial.print(GPS.lastNMEA()); // this also sets the newNMEAreceived() flag to false
+      GPS.parse(GPS.lastNMEA()); // this also sets the newNMEAreceived() flag to false
+      Serial.println("Parsed GPS!");
+      break;
+    }
+  }
+  Serial.println(GPS.fix);
   // read data from the GPS in the 'main loop'
   char c = GPS.read();
 
-  // if (c) Serial.print(c);
+  if (!c) {
+    Serial.println("Got nothing from GPS!");
+  }
   // if a sentence is received, we can check the checksum
   if (GPS.newNMEAreceived()) {
     // Serial.print(GPS.lastNMEA()); // this also sets the newNMEAreceived() flag to false
@@ -108,17 +136,9 @@ GPSData read_gps() {
   data.valid = false;
   if (GPS.fix) {
     data.valid = true;
-    data.lat = GPS.latitude;
+    data.lat = GPS.latitude; // This is sent in nmea format, should be decoded by the reciever
     data.lon = GPS.longitude;
-    // Serial.print("Location: ");
-    // Serial.print(GPS.latitude, 4); Serial.print(GPS.lat);
-    // Serial.print(", ");
-    // Serial.print(GPS.longitude, 4); Serial.println(GPS.lon);
-    // Serial.print("Speed (knots): "); Serial.println(GPS.speed);
-    // Serial.print("Angle: "); Serial.println(GPS.angle);
-    //Serial.print("Altitude: "); Serial.println(GPS.altitude);
-    //Serial.print("Satellites: "); Serial.println((int)GPS.satellites);
-    //Serial.print("Antenna status: "); Serial.println((int)GPS.antenna);
+    data.speed = GPS.speed * 1.150779; // Knots to MPH
   }
   return data;
 }
@@ -130,11 +150,17 @@ void init_sd() {
   }
 }
 
+void init_can() {
+  if (CAN.begin(CAN_500KBPS) != CAN_OK) {
+    Serial.println("CAN initialization failed!");
+  }
+}
+
 void init_file() {
   SD.remove(fn);
   File f = SD.open(fn, FILE_WRITE);
   if (f) {
-    f.println("RPM,Slope,Speed,BV,Lat,Lon");
+    f.println("RPM,AccelX,AccelY,AccelZ,Speed,BV,Lat,Lon");
     // close the file:
     f.close();
   } else {
@@ -148,7 +174,11 @@ void dump_file(telemPacket packet) {
     f.seek(EOF);
     f.print(packet.RPM);
     f.print(",");
-    f.print(packet.slope);
+    f.print(packet.accel_x);
+    f.print(",");
+    f.print(packet.accel_y);
+    f.print(",");
+    f.print(packet.accel_z);
     f.print(",");
     f.print(packet.speed);
     f.print(",");
@@ -191,7 +221,7 @@ void send_packet_part(int i) {
 void send_packet_part(float f, int prec) {
   dtostrf(f, 2, prec, packet_buffer+packet_length);
   // sprintf(packet_buffer + packet_length, "%f", f);
-  packet_length += DispSerial.print(f);
+  packet_length += DispSerial.print(packet_buffer+packet_length);
   // Serial.println(f);
 }
 void send_packet_part(float f) {
@@ -218,7 +248,6 @@ void finish_packet() {
   char buffer[8];
   LoRaSerial.readBytes(buffer, 5); // +OK\r\n
   buffer[5] = 0;
-  Serial.println(buffer);
 }
 
 void write_field(char* s, int v) {
@@ -243,13 +272,16 @@ void send_packet(telemPacket packet) {
   send_packet_part("TELEM");
   send_packet_part(packet_idx++);
   write_field("RPM", packet.RPM);
-  write_field("Slope", packet.slope);
+  write_field("ACCX", packet.accel_x);
+  write_field("ACCY", packet.accel_y);
+  write_field("ACCZ", packet.accel_z);
   write_field("BV", packet.BV);
   write_field("Speed", packet.speed);
   if (packet.gps_valid) {
     write_field("LAT", packet.lat, 8);
     write_field("LON", packet.lon, 8);
   }
+  send_packet_part(';');
 
   finish_packet();
 }
@@ -279,16 +311,20 @@ void read_dummy_packets() {
   }
 }
 
+const float IMU_LSB_SENS = 16384.0;
 telemPacket poll_data() {
   telemPacket p;
   // IMU data
   imuData d = read_imu();
-  p.slope = d.accelerometer_y;
+  p.accel_x = d.accelerometer_x / IMU_LSB_SENS;
+  p.accel_y = d.accelerometer_y / IMU_LSB_SENS;
+  p.accel_z = d.accelerometer_z / IMU_LSB_SENS;
   // GPS data
   GPSData g = read_gps();
   p.gps_valid = g.valid;
   p.lat = g.lat;
   p.lon = g.lon;
+  p.speed = g.speed;
   // Placeholders
   p.BV = 12;
   p.RPM = 3000;
@@ -335,12 +371,12 @@ void setup() {
   Serial.begin(57600);
   DispSerial.begin(57600);
   LoRaSerial.begin(115200);
-  init_sd();
+  // init_sd();
   init_imu();
   init_lora();
-  // init_gps();
+  init_gps();
 
-  init_file();
+  // init_file();
   // telemPacket p = {3000, 28.2, 0.8, 11.99};
   // dump_file(p);
   // while (1) {
@@ -352,7 +388,7 @@ void setup() {
 void loop() {
   telemPacket p = poll_data();
   send_packet(p);
-  dump_file(p);
+  // dump_file(p);
   // read_dummy_packets();
   // Serial.println("New section!");
 }
